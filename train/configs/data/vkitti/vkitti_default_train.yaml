@@ -1,0 +1,10 @@
+!!python/object:options.DataOptions
+dataset_path: /scratch/cvlab/datasets/dataset_afan/mvsanywhere_datasets/VKITTI2
+tuple_info_file_location: data_splits/vkitti/
+dataset_scan_split_file: data_splits/vkitti/vkitti_train.txt
+dataset: vkitti
+mv_tuple_file_suffix: _eight_view_deepvmvs.txt
+num_images_in_tuple: 8
+frame_tuple_type: default
+split: train
+train_maximum_pose_distance: 1.00

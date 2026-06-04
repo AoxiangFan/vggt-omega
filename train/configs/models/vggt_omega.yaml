@@ -1,0 +1,28 @@
+!!python/object:options.Options
+name: vggt_omega
+log_dir: ./logs
+
+# training
+max_epochs: 16
+precision: bf16-mixed
+lr: 0.0001
+wd: 0.0001
+batch_size: 4
+val_batch_size: 4
+grad_clip_norm: 1.0
+num_sanity_val_steps: 0
+
+# model
+patch_size: 16
+embed_dim: 1024
+enable_camera: true
+enable_depth: true
+enable_alignment: false
+use_sparse_index: true
+use_triton_sparse: false
+backbone_lr_scale: 0.1
+
+# logging
+log_interval: 100
+val_interval: 1000
+val_batches: 100
