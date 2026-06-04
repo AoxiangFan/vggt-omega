@@ -28,6 +28,8 @@ class Aggregator(nn.Module):
         num_register_tokens: int = 16,
         register_attention_block_indices: list[int] = [2, 6, 9, 14, 20],
         cached_layer_indices: tuple[int, ...] = (4, 11, 17, 23),
+        use_sparse_index: bool = True,
+        use_triton_sparse: bool = False,
     ) -> None:
         super().__init__()
 
@@ -70,6 +72,8 @@ class Aggregator(nn.Module):
                     init_values=1e-5,
                     use_qk_norm=True,
                     mask_k_bias=True,
+                    use_sparse_index=use_sparse_index,
+                    use_triton_sparse=use_triton_sparse,
                 )
                 for _ in range(depth)
             ]
@@ -153,6 +157,71 @@ class Aggregator(nn.Module):
 
         return outputs, self.patch_token_start
 
+    def forward_with_index(
+        self,
+        images: torch.Tensor,
+        index: torch.Tensor,
+    ) -> tuple[list[torch.Tensor | None], int]:
+        """Same as forward but uses sparse indexed attention for global inter-frame blocks.
+
+        index: (B, V*patches, K) — for each patch query, the K token positions it
+            may attend to.  Values are 1-indexed; position 0 is a learned dummy token
+            used for padding.  See SelfAttention._compute_sparse_attention for details.
+        """
+        batch_size, num_frames, num_channels, height, width = images.shape
+        if num_channels != 3:
+            raise ValueError(f"Expected 3 input channels, got {num_channels}")
+
+        images = (images - self._resnet_mean) / self._resnet_std
+        images = images.view(batch_size * num_frames, num_channels, height, width)
+
+        camera_token = slice_expand_and_flatten(self.camera_token, batch_size, num_frames)
+        register_token = slice_expand_and_flatten(self.register_token, batch_size, num_frames)
+
+        patch_tokens = self.patch_embed(images)
+        if isinstance(patch_tokens, dict):
+            patch_tokens = patch_tokens["x_norm_patchtokens"]
+
+        tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        _, num_tokens, embed_dim = tokens.shape
+
+        patch_grid_size = (height // self.patch_size, width // self.patch_size)
+        with torch.no_grad():
+            rope_sin, rope_cos = self.rope_embed(H=patch_grid_size[0], W=patch_grid_size[1])
+            frame_rope = (
+                rope_sin.to(device=patch_tokens.device, dtype=torch.float32),
+                rope_cos.to(device=patch_tokens.device, dtype=torch.float32),
+            )
+
+        outputs = []
+        for block_idx in range(self.depth):
+            tokens, frame_tokens = self._run_frame_block(
+                tokens,
+                batch_size,
+                num_frames,
+                num_tokens,
+                embed_dim,
+                block_idx,
+                frame_rope,
+            )
+            attn_type = self.inter_frame_attention_types[block_idx]
+            tokens = self._run_inter_frame_attention_block(
+                tokens,
+                batch_size,
+                num_frames,
+                num_tokens,
+                embed_dim,
+                block_idx,
+                attn_type,
+                index=index if attn_type == "global" else None,
+            )
+            if block_idx in self.cached_layer_indices:
+                outputs.append(torch.cat([frame_tokens, tokens], dim=-1))
+            else:
+                outputs.append(None)
+
+        return outputs, self.patch_token_start
+
     def _run_frame_block(
         self,
         tokens: torch.Tensor,
@@ -176,12 +245,15 @@ class Aggregator(nn.Module):
         embed_dim: int,
         block_idx: int,
         attention_type: str,
+        index: torch.Tensor = None,
     ) -> torch.Tensor:
         tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type == "global":
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
-            tokens = self.inter_frame_blocks[block_idx](tokens, None)
+            tokens = self.inter_frame_blocks[block_idx](
+                tokens, None, index=index, ps_idx=self.patch_token_start
+            )
             return tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type != "register":

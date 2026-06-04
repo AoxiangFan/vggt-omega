@@ -38,6 +38,8 @@ class SelfAttentionBlock(nn.Module):
         ffn_layer: Callable[..., nn.Module] = Mlp,
         mask_k_bias: bool = False,
         use_qk_norm: bool = False,
+        use_sparse_index: bool = False,
+        use_triton_sparse: bool = False,
         device=None,
     ) -> None:
         super().__init__()
@@ -54,6 +56,8 @@ class SelfAttentionBlock(nn.Module):
             # VGGT-Omega change: pass through Q/K normalization for the
             # aggregator blocks trained with q_norm/k_norm parameters.
             use_qk_norm=use_qk_norm,
+            use_sparse_index=use_sparse_index,
+            use_triton_sparse=use_triton_sparse,
             device=device,
         )
         self.ls1 = LayerScale(dim, init_values=init_values, device=device) if init_values else nn.Identity()
@@ -128,7 +132,7 @@ class SelfAttentionBlock(nn.Module):
 
         return x_ffn
 
-    def _forward_list(self, x_list: List[Tensor], rope_list=None) -> List[Tensor]:
+    def _forward_list(self, x_list: List[Tensor], rope_list=None, index=None, ps_idx: int = 0) -> List[Tensor]:
         """
         This list operator concatenates the tokens from the list of inputs together to save
         on the elementwise operations. Torch-compile memory-planning allows hiding the overhead
@@ -139,6 +143,7 @@ class SelfAttentionBlock(nn.Module):
         residual_scale_factors = [b / sample_subset_size for b, sample_subset_size in zip(b_list, sample_subset_sizes)]
 
         if self.training and self.sample_drop_ratio > 0.0:
+            assert index is None, "Sparse index attention is not supported with drop_path > 0"
             indices_1_list = [
                 (torch.randperm(b, device=x.device))[:sample_subset_size]
                 for x, b, sample_subset_size in zip(x_list, b_list, sample_subset_sizes)
@@ -195,24 +200,24 @@ class SelfAttentionBlock(nn.Module):
         else:
             x_out = []
             for x, rope in zip(x_list, rope_list):
-                x_attn = x + self.ls1(self.attn(self.norm1(x), rope=rope))
+                x_attn = x + self.ls1(self.attn(self.norm1(x), rope=rope, index=index, ps_idx=ps_idx))
                 x_ffn = x_attn + self.ls2(self.mlp(self.norm2(x_attn)))
                 x_out.append(x_ffn)
             x_ffn = x_out
 
         return x_ffn
 
-    def forward(self, x_or_x_list, rope_or_rope_list=None) -> List[Tensor]:
+    def forward(self, x_or_x_list, rope_or_rope_list=None, index=None, ps_idx: int = 0) -> List[Tensor]:
         if isinstance(x_or_x_list, Tensor):
             # for reference:
             # return self._forward(x_or_x_list, rope=rope_or_rope_list)
             # in order to match implementations we call the list op:
-            return self._forward_list([x_or_x_list], rope_list=[rope_or_rope_list])[0]
+            return self._forward_list([x_or_x_list], rope_list=[rope_or_rope_list], index=index, ps_idx=ps_idx)[0]
         elif isinstance(x_or_x_list, list):
             if rope_or_rope_list is None:
                 rope_or_rope_list = [None for x in x_or_x_list]
             # return [self._forward(x, rope=rope) for x, rope in zip(x_or_x_list, rope_or_rope_list)]
-            return self._forward_list(x_or_x_list, rope_list=rope_or_rope_list)
+            return self._forward_list(x_or_x_list, rope_list=rope_or_rope_list, index=index, ps_idx=ps_idx)
         else:
             raise AssertionError
 

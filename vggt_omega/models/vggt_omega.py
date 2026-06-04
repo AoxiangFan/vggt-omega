@@ -23,22 +23,44 @@ class VGGTOmega(nn.Module):
         enable_camera: bool = True,
         enable_depth: bool = True,
         enable_alignment: bool = False,
+        use_sparse_index: bool = True,
+        use_triton_sparse: bool = False,
     ) -> None:
         super().__init__()
 
-        self.aggregator = Aggregator(patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            use_sparse_index=use_sparse_index,
+            use_triton_sparse=use_triton_sparse,
+        )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
         self.text_alignment_head = TextAlignmentHead(dim_in=2 * embed_dim) if enable_alignment else None
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self._forward(images, index=None)
+
+    def forward_with_index(self, images: torch.Tensor, index: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Forward pass with sparse indexed attention for global inter-frame blocks.
+
+        index: (B, V*patches, K) — for each patch token, the K positions it may
+            attend to during global attention.  Values are 1-indexed; 0 is a dummy
+            token used for padding.  See Aggregator.forward_with_index for details.
+        """
+        return self._forward(images, index=index)
+
+    def _forward(self, images: torch.Tensor, index: torch.Tensor | None) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
 
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            aggregated_tokens_list, patch_token_start = self.aggregator(images)
+            if index is not None:
+                aggregated_tokens_list, patch_token_start = self.aggregator.forward_with_index(images, index)
+            else:
+                aggregated_tokens_list, patch_token_start = self.aggregator(images)
 
         final_tokens = aggregated_tokens_list[-1]
         if final_tokens is None:
